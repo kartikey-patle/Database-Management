@@ -1,0 +1,356 @@
+// main_gui.cpp - GTK3 front end for the B+ tree database.
+// Build: make gui     (needs libgtk-3-dev)
+#include <gtk/gtk.h>
+
+#include <algorithm>
+#include <cmath>
+#include <random>
+#include <string>
+
+#include "database.hpp"
+
+struct App {
+    StudentDB db{4};
+    GtkWidget *win, *e_id, *e_name, *e_dept, *e_cgpa, *e_lo, *e_hi, *e_find, *e_gen, *spin_order;
+    GtkWidget *status, *draw;
+    GtkListStore* store;
+    std::mt19937 rng{std::random_device{}()};
+};
+
+static void set_status(App* a, const std::string& msg) {
+    gtk_label_set_text(GTK_LABEL(a->status), msg.c_str());
+}
+
+static void show_rows(App* a, const std::vector<Student>& rows) {
+    gtk_list_store_clear(a->store);
+    for (const auto& s : rows) {
+        GtkTreeIter it;
+        gtk_list_store_append(a->store, &it);
+        gtk_list_store_set(a->store, &it, 0, s.id, 1, s.name.c_str(), 2, s.dept.c_str(), 3,
+                           s.cgpa, -1);
+    }
+}
+
+static void refresh(App* a, const std::string& msg) {
+    show_rows(a, a->db.all());
+    gtk_widget_queue_draw(a->draw);
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s   |   records: %zu   height: %d   nodes: %zu   order: %d",
+             msg.c_str(), a->db.count(), a->db.index().height(), a->db.index().nodeCount(),
+             a->db.index().order());
+    set_status(a, buf);
+}
+
+static bool read_student(App* a, Student& s, bool need_fields = true) {
+    const char* id = gtk_entry_get_text(GTK_ENTRY(a->e_id));
+    if (!*id) { set_status(a, "Enter an ID"); return false; }
+    char* end;
+    s.id = (int)strtol(id, &end, 10);
+    if (*end) { set_status(a, "ID must be an integer"); return false; }
+    if (!need_fields) return true;
+    s.name = gtk_entry_get_text(GTK_ENTRY(a->e_name));
+    s.dept = gtk_entry_get_text(GTK_ENTRY(a->e_dept));
+    const char* c = gtk_entry_get_text(GTK_ENTRY(a->e_cgpa));
+    s.cgpa = atof(c);
+    if (s.name.empty()) { set_status(a, "Enter a name"); return false; }
+    return true;
+}
+
+static void on_insert(GtkWidget*, App* a) {
+    Student s;
+    if (!read_student(a, s)) return;
+    refresh(a, a->db.insert(s) ? "Inserted" : "ERROR: ID already exists");
+}
+static void on_update(GtkWidget*, App* a) {
+    Student s;
+    if (!read_student(a, s)) return;
+    refresh(a, a->db.update(s) ? "Updated" : "ERROR: ID not found");
+}
+static void on_delete(GtkWidget*, App* a) {
+    Student s;
+    if (!read_student(a, s, false)) return;
+    refresh(a, a->db.remove(s.id) ? "Deleted" : "ERROR: ID not found");
+}
+static void on_search(GtkWidget*, App* a) {
+    Student s;
+    if (!read_student(a, s, false)) return;
+    const Student* r = a->db.get(s.id);
+    if (!r) { show_rows(a, {}); set_status(a, "Not found"); return; }
+    size_t visits = a->db.index().lastVisits();
+    show_rows(a, {*r});
+    gtk_entry_set_text(GTK_ENTRY(a->e_name), r->name.c_str());
+    gtk_entry_set_text(GTK_ENTRY(a->e_dept), r->dept.c_str());
+    gtk_entry_set_text(GTK_ENTRY(a->e_cgpa), std::to_string(r->cgpa).substr(0, 4).c_str());
+    set_status(a, "Found in " + std::to_string(visits) + " node visits (tree height " +
+                      std::to_string(a->db.index().height()) + ")");
+}
+static void on_range(GtkWidget*, App* a) {
+    int lo = atoi(gtk_entry_get_text(GTK_ENTRY(a->e_lo)));
+    int hi = atoi(gtk_entry_get_text(GTK_ENTRY(a->e_hi)));
+    auto rows = a->db.range(lo, hi);
+    show_rows(a, rows);
+    set_status(a, "Range query returned " + std::to_string(rows.size()) + " rows");
+}
+static void on_find_name(GtkWidget*, App* a) {
+    auto rows = a->db.searchName(gtk_entry_get_text(GTK_ENTRY(a->e_find)));
+    show_rows(a, rows);
+    set_status(a, "Name search (full leaf scan) returned " + std::to_string(rows.size()) + " rows");
+}
+static void on_show_all(GtkWidget*, App* a) { refresh(a, "Showing all"); }
+static void on_clear(GtkWidget*, App* a) { a->db.clear(); refresh(a, "Cleared"); }
+
+static void on_generate(GtkWidget*, App* a) {
+    static const char* names[] = {"Aarav", "Diya", "Rohan", "Isha", "Kabir", "Meera", "Vivaan", "Anaya"};
+    static const char* depts[] = {"CSE", "ECE", "MECH", "CIVIL", "IT", "EEE"};
+    int n = std::max(1, std::min(500, atoi(gtk_entry_get_text(GTK_ENTRY(a->e_gen)))));
+    int added = 0;
+    while (added < n) {
+        Student s;
+        s.id = 1 + a->rng() % 999;
+        s.name = names[a->rng() % 8];
+        s.dept = depts[a->rng() % 6];
+        s.cgpa = 5.0 + (a->rng() % 501) / 100.0;
+        if (a->db.insert(s)) ++added;
+        if (a->db.count() >= 999) break;
+    }
+    refresh(a, "Generated random records");
+}
+static void on_order(GtkSpinButton* sp, App* a) {
+    a->db.setOrder(gtk_spin_button_get_value_as_int(sp));
+    refresh(a, "Index rebuilt");
+}
+
+static void on_row_selected(GtkTreeSelection* sel, App* a) {
+    GtkTreeModel* m;
+    GtkTreeIter it;
+    if (!gtk_tree_selection_get_selected(sel, &m, &it)) return;
+    gint id; gchar *name, *dept; gdouble cgpa;
+    gtk_tree_model_get(m, &it, 0, &id, 1, &name, 2, &dept, 3, &cgpa, -1);
+    gtk_entry_set_text(GTK_ENTRY(a->e_id), std::to_string(id).c_str());
+    gtk_entry_set_text(GTK_ENTRY(a->e_name), name);
+    gtk_entry_set_text(GTK_ENTRY(a->e_dept), dept);
+    char buf[32]; snprintf(buf, sizeof buf, "%.2f", cgpa);
+    gtk_entry_set_text(GTK_ENTRY(a->e_cgpa), buf);
+    g_free(name); g_free(dept);
+}
+
+static std::string pick_file(App* a, bool save) {
+    GtkWidget* d = gtk_file_chooser_dialog_new(save ? "Save CSV" : "Open CSV", GTK_WINDOW(a->win),
+        save ? GTK_FILE_CHOOSER_ACTION_SAVE : GTK_FILE_CHOOSER_ACTION_OPEN, "_Cancel",
+        GTK_RESPONSE_CANCEL, save ? "_Save" : "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    std::string path;
+    if (gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_ACCEPT) {
+        char* f = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(d));
+        path = f; g_free(f);
+    }
+    gtk_widget_destroy(d);
+    return path;
+}
+static void on_save(GtkWidget*, App* a) {
+    std::string p = pick_file(a, true);
+    if (!p.empty()) set_status(a, a->db.save(p) ? "Saved " + p : "ERROR: cannot write file");
+}
+static void on_load(GtkWidget*, App* a) {
+    std::string p = pick_file(a, false);
+    if (p.empty()) return;
+    int n = a->db.load(p);
+    if (n < 0) set_status(a, "ERROR: cannot open file");
+    else refresh(a, "Loaded " + std::to_string(n) + " rows");
+}
+
+// ------------------------------------------------------------ tree drawing
+static const double BW_KEY = 34, BH = 30, GAP_X = 14, GAP_Y = 60, PAD = 20;
+
+static double node_width(size_t nkeys) { return std::max<size_t>(nkeys, 1) * BW_KEY; }
+
+static gboolean on_draw(GtkWidget* w, cairo_t* cr, App* a) {
+    auto snap = a->db.index().snapshot();
+    int maxLevel = 0;
+    for (auto& n : snap) maxLevel = std::max(maxLevel, n.level);
+
+    // x layout: leaves left->right, internal nodes centered above their children
+    std::vector<double> x(snap.size(), 0), wd(snap.size());
+    double cursor = PAD;
+    for (size_t i = 0; i < snap.size(); ++i) wd[i] = node_width(snap[i].keys.size());
+    for (size_t i = 0; i < snap.size(); ++i)
+        if (snap[i].leaf) { x[i] = cursor + wd[i] / 2; cursor += wd[i] + GAP_X; }
+    for (int i = (int)snap.size() - 1; i >= 0; --i)
+        if (!snap[i].leaf) x[i] = (x[snap[i].children.front()] + x[snap[i].children.back()]) / 2;
+
+    double total_w = cursor + PAD, total_h = PAD * 2 + (maxLevel + 1) * (BH + GAP_Y);
+    gtk_widget_set_size_request(w, (int)total_w, (int)total_h);
+
+    cairo_set_font_size(cr, 12);
+    cairo_set_line_width(cr, 1.2);
+    auto ypos = [&](int lvl) { return PAD + lvl * (BH + GAP_Y); };
+
+    // edges parent -> child
+    cairo_set_source_rgb(cr, 0.45, 0.45, 0.5);
+    for (auto& n : snap)
+        for (int c : n.children) {
+            size_t pi = &n - &snap[0];
+            cairo_move_to(cr, x[pi], ypos(n.level) + BH);
+            cairo_line_to(cr, x[c], ypos(snap[c].level));
+            cairo_stroke(cr);
+        }
+    // leaf chain arrows
+    cairo_set_source_rgb(cr, 0.85, 0.35, 0.1);
+    std::vector<int> leaves;
+    for (size_t i = 0; i < snap.size(); ++i) if (snap[i].leaf) leaves.push_back((int)i);
+    for (size_t k = 0; k + 1 < leaves.size(); ++k) {
+        int a1 = leaves[k], b1 = leaves[k + 1];
+        double y = ypos(snap[a1].level) + BH / 2;
+        cairo_move_to(cr, x[a1] + wd[a1] / 2, y);
+        cairo_line_to(cr, x[b1] - wd[b1] / 2, y);
+        cairo_stroke(cr);
+    }
+    // nodes
+    for (size_t i = 0; i < snap.size(); ++i) {
+        double left = x[i] - wd[i] / 2, top = ypos(snap[i].level);
+        if (snap[i].leaf) cairo_set_source_rgb(cr, 0.80, 0.93, 0.80);
+        else cairo_set_source_rgb(cr, 0.80, 0.88, 0.98);
+        cairo_rectangle(cr, left, top, wd[i], BH);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgb(cr, 0.15, 0.15, 0.2);
+        cairo_stroke(cr);
+        for (size_t k = 0; k < snap[i].keys.size(); ++k) {
+            double kx = left + k * BW_KEY;
+            if (k) { cairo_move_to(cr, kx, top); cairo_line_to(cr, kx, top + BH); cairo_stroke(cr); }
+            std::string t = std::to_string(snap[i].keys[k]);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, t.c_str(), &ext);
+            cairo_move_to(cr, kx + (BW_KEY - ext.width) / 2 - ext.x_bearing, top + BH / 2 + ext.height / 2);
+            cairo_show_text(cr, t.c_str());
+        }
+    }
+    return FALSE;
+}
+
+// ------------------------------------------------------------------ layout
+static GtkWidget* labeled_entry(GtkWidget* grid, int row, const char* label, int width) {
+    GtkWidget* l = gtk_label_new(label);
+    gtk_widget_set_halign(l, GTK_ALIGN_START);
+    GtkWidget* e = gtk_entry_new();
+    gtk_entry_set_width_chars(GTK_ENTRY(e), width);
+    gtk_grid_attach(GTK_GRID(grid), l, 0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), e, 1, row, 1, 1);
+    return e;
+}
+static GtkWidget* button(const char* label, GCallback cb, App* a) {
+    GtkWidget* b = gtk_button_new_with_label(label);
+    g_signal_connect(b, "clicked", cb, a);
+    return b;
+}
+
+static void activate(GtkApplication* app, gpointer data) {
+    App* a = (App*)data;
+    a->win = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(a->win), "B+ Tree Database");
+    gtk_window_set_default_size(GTK_WINDOW(a->win), 1100, 700);
+
+    GtkWidget* root = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(root), 10);
+    gtk_container_add(GTK_CONTAINER(a->win), root);
+
+    // ---- left: controls
+    GtkWidget* left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_pack_start(GTK_BOX(root), left, FALSE, FALSE, 0);
+
+    GtkWidget* f1 = gtk_frame_new("Record");
+    GtkWidget* g1 = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(g1), 4); gtk_grid_set_column_spacing(GTK_GRID(g1), 6);
+    gtk_container_set_border_width(GTK_CONTAINER(g1), 6);
+    a->e_id = labeled_entry(g1, 0, "ID", 14);
+    a->e_name = labeled_entry(g1, 1, "Name", 14);
+    a->e_dept = labeled_entry(g1, 2, "Dept", 14);
+    a->e_cgpa = labeled_entry(g1, 3, "CGPA", 14);
+    GtkWidget* bb = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(bb), 4); gtk_grid_set_column_spacing(GTK_GRID(bb), 4);
+    gtk_grid_attach(GTK_GRID(bb), button("Insert", G_CALLBACK(on_insert), a), 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(bb), button("Search", G_CALLBACK(on_search), a), 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(bb), button("Update", G_CALLBACK(on_update), a), 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(bb), button("Delete", G_CALLBACK(on_delete), a), 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(g1), bb, 0, 4, 2, 1);
+    gtk_container_add(GTK_CONTAINER(f1), g1);
+    gtk_box_pack_start(GTK_BOX(left), f1, FALSE, FALSE, 0);
+
+    GtkWidget* f2 = gtk_frame_new("Queries");
+    GtkWidget* g2 = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(g2), 4); gtk_grid_set_column_spacing(GTK_GRID(g2), 6);
+    gtk_container_set_border_width(GTK_CONTAINER(g2), 6);
+    a->e_lo = labeled_entry(g2, 0, "From ID", 14);
+    a->e_hi = labeled_entry(g2, 1, "To ID", 14);
+    gtk_grid_attach(GTK_GRID(g2), button("Range query", G_CALLBACK(on_range), a), 0, 2, 2, 1);
+    a->e_find = labeled_entry(g2, 3, "Name has", 14);
+    gtk_grid_attach(GTK_GRID(g2), button("Search by name", G_CALLBACK(on_find_name), a), 0, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(g2), button("Show all", G_CALLBACK(on_show_all), a), 0, 5, 2, 1);
+    gtk_container_add(GTK_CONTAINER(f2), g2);
+    gtk_box_pack_start(GTK_BOX(left), f2, FALSE, FALSE, 0);
+
+    GtkWidget* f3 = gtk_frame_new("Tools");
+    GtkWidget* g3 = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(g3), 4); gtk_grid_set_column_spacing(GTK_GRID(g3), 6);
+    gtk_container_set_border_width(GTK_CONTAINER(g3), 6);
+    a->e_gen = labeled_entry(g3, 0, "Random rows", 14);
+    gtk_entry_set_text(GTK_ENTRY(a->e_gen), "20");
+    gtk_grid_attach(GTK_GRID(g3), button("Generate", G_CALLBACK(on_generate), a), 0, 1, 2, 1);
+    gtk_grid_attach(GTK_GRID(g3), gtk_label_new("Tree order"), 0, 2, 1, 1);
+    a->spin_order = gtk_spin_button_new_with_range(3, 12, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->spin_order), 4);
+    g_signal_connect(a->spin_order, "value-changed", G_CALLBACK(on_order), a);
+    gtk_grid_attach(GTK_GRID(g3), a->spin_order, 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(g3), button("Save CSV", G_CALLBACK(on_save), a), 0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(g3), button("Load CSV", G_CALLBACK(on_load), a), 1, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(g3), button("Clear table", G_CALLBACK(on_clear), a), 0, 4, 2, 1);
+    gtk_container_add(GTK_CONTAINER(f3), g3);
+    gtk_box_pack_start(GTK_BOX(left), f3, FALSE, FALSE, 0);
+
+    // ---- right: table (top) + tree drawing (bottom)
+    GtkWidget* right = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start(GTK_BOX(root), right, TRUE, TRUE, 0);
+
+    a->store = gtk_list_store_new(4, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_DOUBLE);
+    GtkWidget* view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(a->store));
+    const char* cols[] = {"ID", "Name", "Dept", "CGPA"};
+    for (int i = 0; i < 4; ++i) {
+        GtkCellRenderer* r = gtk_cell_renderer_text_new();
+        GtkTreeViewColumn* c = gtk_tree_view_column_new_with_attributes(cols[i], r, "text", i, NULL);
+        gtk_tree_view_column_set_resizable(c, TRUE);
+        gtk_tree_view_column_set_expand(c, TRUE);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(view), c);
+    }
+    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), "changed",
+                     G_CALLBACK(on_row_selected), a);
+    GtkWidget* sw1 = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(sw1), view);
+    gtk_paned_pack1(GTK_PANED(right), sw1, TRUE, FALSE);
+
+    GtkWidget* tf = gtk_frame_new("B+ tree structure (blue = internal, green = leaf, orange = leaf links)");
+    a->draw = gtk_drawing_area_new();
+    g_signal_connect(a->draw, "draw", G_CALLBACK(on_draw), a);
+    GtkWidget* sw2 = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(sw2), a->draw);
+    gtk_container_add(GTK_CONTAINER(tf), sw2);
+    gtk_paned_pack2(GTK_PANED(right), tf, TRUE, FALSE);
+    gtk_paned_set_position(GTK_PANED(right), 260);
+
+    a->status = gtk_label_new("Ready");
+    gtk_widget_set_halign(a->status, GTK_ALIGN_START);
+    GtkWidget* outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_remove(GTK_CONTAINER(a->win), root);
+    gtk_box_pack_start(GTK_BOX(outer), root, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), a->status, FALSE, FALSE, 4);
+    gtk_container_add(GTK_CONTAINER(a->win), outer);
+
+    refresh(a, "Ready");
+    gtk_widget_show_all(a->win);
+}
+
+int main(int argc, char** argv) {
+    App app;
+    GtkApplication* gapp = gtk_application_new("edu.dsa.bptreedb", G_APPLICATION_FLAGS_NONE);
+    g_signal_connect(gapp, "activate", G_CALLBACK(activate), &app);
+    int rc = g_application_run(G_APPLICATION(gapp), argc, argv);
+    g_object_unref(gapp);
+    return rc;
+}
